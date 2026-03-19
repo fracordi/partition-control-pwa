@@ -8,20 +8,26 @@ from scipy.linalg import block_diag
 import itertools
 import time
 import warnings
+from matplotlib.patches import Rectangle
+
+
+from sympy.codegen.ast import Raise
 
 
 class OptimalControllerPWA:
     def __init__(self, n_x: int, n_u: int, n_unc: int, N_horizon: int,
-                 modes: list, X: dict, U: dict,
+                 A: np.ndarray, B: np.ndarray, C: np.ndarray,
+                 E: list, e: list, modes: list, X: dict, U: dict,
                  Q: np.ndarray, R: np.ndarray,
                  x_ref: np.ndarray, u_ref: np.ndarray,
                  norm_type: int, eps: float, SOLVER: str):
         """
         Initialize OptimalControllerPWA with the simulations parameters.
         """
-
         self.n_x, self.n_u, self.n_unc, self.N_horizon = n_x, n_u, n_unc, N_horizon
-        self.modes, self.num_modes_horizon = modes, len(modes) ** (self.N_horizon - 1)
+        self.A, self.B, self.C, self.E, self.e = A, B, C, E, e
+        self.modes, self.num_modes_horizon_x0 = modes, len(modes) ** (self.N_horizon - 1)
+        self.num_modes_horizon_all = len(modes) ** self.N_horizon
         self.X, self.U = X, U
         self.Q, self.R = Q, R
         self.x_ref, self.u_ref = x_ref, u_ref
@@ -29,12 +35,14 @@ class OptimalControllerPWA:
         self.solver = SOLVER
 
         # Placeholders for compact matrices and solution details.
-        self.F = self.G = self.L = None
+        self.F = self.G = self.L = self.V = None
+        self.pwa_regions_horizon = self.initial_mode = None
+        self.modes_idx_x0 = None
         self.Xn = self.Un = self.Qn = self.Rn = None
         self.X_ref = self.U_ref = None
         self.u_optimal = self.x_optimal = self.cost_optimal = self.solver_time = None
 
-    def compact_matrices_given_sequence(self, mode_seq: list, size_pwa_region: int):
+    def compact_matrices_given_sequence(self, mode_seq: list, size_pwa_region: int) -> tuple:
         """
         Construct matrices for compact PWA dynamics:
         X+ = F_h x0 + G_h u + L_h \eta + v
@@ -43,11 +51,10 @@ class OptimalControllerPWA:
         Args:
             mode_seq: A possible sequence of modes
             size_pwa_region: number of rows of pwa_region['A']
-
         Returns:
-            Tuple of (F, G, L, V, pwa_region) defining PWA dynamics over horizon
+            Tuple of (F, G, L, V, pwa_region, initial_mode) matrices defining the trajectory model and region constraints.
         """
-
+        initial_mode = mode_seq[0]
         N = self.N_horizon
         n_x, n_u, n_unc = self.n_x, self.n_u, self.n_unc
 
@@ -55,7 +62,7 @@ class OptimalControllerPWA:
         F_blocks = []
         V_blocks = []
         current_F = np.eye(n_x)  # initially, F0 = I (x0 remains x0)
-        current_V = np.zeros((n_x, 1))
+        current_V = np.zeros((n_x, 1))  # no offset at time 0
         for k in range(N):
             mode_k = mode_seq[k]
             A_k = self.modes[mode_k]['A']
@@ -105,7 +112,7 @@ class OptimalControllerPWA:
             e_k = self.modes[mode_k]['e']  # e.g., a vector of size (n_constr_k, 1)
             E_blocks.append(E_k)
             e_blocks.append(e_k)
-        # Form block-diagonal matrix for all stages:
+        # Form block-diagonal matrix for all steps:
         E_comp = block_diag(*E_blocks)
         E_comp = np.hstack((E_comp, np.zeros((E_comp.shape[0], self.n_x))))
         e_comp = np.vstack(e_blocks)
@@ -114,44 +121,53 @@ class OptimalControllerPWA:
             e_comp = np.vstack((e_comp, np.zeros((size_pwa_region - e_comp.shape[0], 1))))
         pwa_region = {'A': E_comp, 'b': e_comp}
 
-        return F_full, G_full, L_full, V_full, pwa_region
+        return F_full, G_full, L_full, V_full, pwa_region, initial_mode
 
-    def get_all_compact_matrices(self, x0: np.ndarray) -> tuple:
+
+    def get_all_compact_matrices(self) -> tuple:
         """
-        Generate all compact matrices (F, G, L, V) for all feasible mode sequences starting at x0.
-
-        Args:
-            x0: Initial state (n_x by 1).
+        Generate all compact matrices (F, G, L, V) combinations.
 
         Returns:
-            Lists of F, G, L, V matrices and PWA regions for each mode sequence.
+            Lists of F, G, L, V matrices and PWA region constraints for each mode sequence, and first mode for each option.
+        """
+        num_modes = len(self.modes)
+        # Generate all possible mode sequences for the horizon.
+        mode_options = [i for i in range(num_modes)]
+        max_dim = max([self.E[i].shape[0] for i in range(num_modes)])
+        max_dim_over_horizon = max_dim * self.N_horizon
+        all_mode_seqs = list(itertools.product(mode_options, repeat=self.N_horizon))
+        all_results = [self.compact_matrices_given_sequence(mode_seq, max_dim_over_horizon)
+                       for mode_seq in all_mode_seqs]
+
+        # Unzip the list of tuples.
+        F_list, G_list, L_list, V_list, pwa_region, initial_mode = zip(*all_results)
+
+        # Convert from tuples to lists and return.
+        return list(F_list), list(G_list), list(L_list), list(V_list), list(pwa_region), list(initial_mode)
+
+    def set_modes_indices_x0(self, x0) -> None:
+        """
+        Set indices of possible modes given current state x0
         """
         num_modes = len(self.modes)
         current_mode = 0
         for i in range(num_modes):
-            if all(self.modes[i]['E'] @ x0 <= self.modes[i]['e']):
+            if all(self.E[i] @ x0 <= self.e[i]):
                 current_mode = i
-        # Generate all possible mode sequences for the horizon.
-        mode_options = [i for i in range(num_modes)]
-        dim_initial_mode = self.modes[current_mode]['E'].shape[0]
-        max_dim = max([self.modes[i]['E'].shape[0] for i in range(num_modes)])
-        max_dim_over_horizon = dim_initial_mode + max_dim * (self.N_horizon - 1)
-        all_mode_seqs = list(itertools.product(mode_options, repeat=self.N_horizon))
-        filtered_seqs = [seq for seq in all_mode_seqs if seq[0] == current_mode]
-        all_results = [self.compact_matrices_given_sequence(mode_seq, max_dim_over_horizon)
-                       for mode_seq in filtered_seqs]
-        F_list, G_list, L_list, V_list, pwa_region = zip(*all_results)
 
-        return list(F_list), list(G_list), list(L_list), list(V_list), list(pwa_region)
+        h_range_x0 = [h for h in range(self.num_modes_horizon_all) if self.initial_mode[h]==current_mode]
+        self.modes_idx_x0 = h_range_x0
 
-    def set_compact_matrices(self, x0: np.ndarray) -> None:
+
+    def set_compact_matrices(self) -> None:
         """
-        Set compact matrices and related PWA region constraints from all feasible mode sequences from x0.
+        Set internal compact matrices and constraint sets based on all feasible mode sequences from x0.
 
         Args:
-            x0: Initial state (n_x , 1).
+            x0: Initial state (n_x, 1).
         """
-        self.F, self.G, self.L, self.V, self.pwa_regions_horizon = self.get_all_compact_matrices(x0)
+        self.F, self.G, self.L, self.V, self.pwa_regions_horizon, self.initial_mode = self.get_all_compact_matrices()
         Hx = np.kron(np.eye(self.N_horizon), self.X['A'])
         Hx = np.hstack((np.zeros((Hx.shape[0], self.n_x)), Hx))
         Hu = np.kron(np.eye(self.N_horizon), self.U['A'])
@@ -169,7 +185,7 @@ class OptimalControllerPWA:
         self.X_ref = np.tile(self.x_ref, (self.N_horizon, 1))
         self.U_ref = np.tile(self.u_ref, (self.N_horizon, 1))
 
-    def compute_sampled_pwa_dynamics_d(self, x0: np.ndarray, u_seq: np.ndarray, samples: np.ndarray) -> np.ndarray:
+    def compute_sampled_pwa_dynamics(self, x0: np.ndarray, u_seq: np.ndarray, samples: np.ndarray) -> tuple:
         """
         Given x0, a sequence of input, and some uncertainty samples, computes the possible PWA dynamics.
 
@@ -183,26 +199,58 @@ class OptimalControllerPWA:
         """
         X = []
         Nsamples = len(samples)
+        alpha = np.zeros((len(samples), self.num_modes_horizon_x0))
         # Compute x_test for all scenarios
-        for h in range(self.num_modes_horizon):
+        for (h, h_alpha) in zip(self.modes_idx_x0, range(self.num_modes_horizon_x0)):
             region = self.pwa_regions_horizon[h]
-            x_h = self.F[h] @ x0 + self.G[h] @ u_seq
+            x_h = self.F[h] @ x0 + self.G[h] @ u_seq + self.V[h]
             x_test_all = np.tile(x_h, (1, Nsamples)) + self.L[h] @ samples.T
             condition_pwa_dyn = np.all(region['A'] @ x_test_all <= region['b'], axis=0)
+            alpha[condition_pwa_dyn, h_alpha] = 1
             x_test_in_region_h = x_test_all[:, condition_pwa_dyn]
             num_samples_region_h = x_test_in_region_h.shape[1]
             if num_samples_region_h >= 1:
                 X.append(x_test_in_region_h.transpose())
-        return np.vstack(X)
+        return np.vstack(X), alpha
+
+
+    def plot_sampled_dynamics(self, x0: np.ndarray, u_seq: np.ndarray, samples: np.ndarray, idx_to_plot, box) -> np.ndarray:
+        """
+        Plot system dynamics corresponding to coordinates in idx_to_plot
+        """
+        X = self.compute_sampled_pwa_dynamics(x0, u_seq, samples)
+        X_to_plot = [X[:, i::self.n_x] for i in idx_to_plot]
+
+        # Create plot
+        fig, axes = plt.subplots(1, 1, figsize=(12, 6))
+        axes.plot(X_to_plot[0].T, X_to_plot[1].T,
+                     color='blue')  # marker='o', linestyle='None', markersize=0.5)
+
+        x1min, x1max = box[0]
+        x2min, x2max = box[1]
+        box = Rectangle((x1min, x2min), x1max - x1min, x2max - x2min, linewidth=2, edgecolor='red', facecolor='none')
+
+        axes.add_patch(box)
+        plt.show()
+
+        x_label = "$x_" + str(idx_to_plot[0]+1) + "$"
+        y_label = "$x_" + str(idx_to_plot[1]+1) + "$"
+        axes.set_xlabel(x_label)
+        axes.set_ylabel(y_label)
+        axes.set_xlim(x1min*1.2, x1max*1.2)
+        axes.set_ylim(x2min*1.2, x2max*1.2)
+        axes.grid(True)
+
+        plt.tight_layout()
+        plt.show()
 
     def compute_sampled_pwa_dynamics_u(self, x0: np.ndarray, u_samples: np.ndarray, d: np.ndarray) -> np.ndarray:
         """
         Given x0, a fixed value for uncertainty, and some input samples, computes the possible PWA dyncamis.
-
         Args:
-            x0: Initial state (n_x , 1).
-            u_samples: Sampled control sequences (Nsamples , n_u * N_horizon).
-            d: Fixed uncertainty vector (n_unc * N_horizon , 1).
+            x0: Initial state (n_x, 1).
+            u_samples: Sampled control sequences (Nsamples, n_u * N_horizon).
+            d: Fixed uncertainty vector (n_unc * N_horizon, 1).
 
         Returns:
             Array of sampled PWA dynamics.
@@ -210,9 +258,9 @@ class OptimalControllerPWA:
         X = []
         Nsamples = len(u_samples)
         # Compute x_test for all input scenarios
-        for h in range(self.num_modes_horizon):
+        for h in self.modes_idx_x0:
             region = self.pwa_regions_horizon[h]
-            x_h = self.F[h] @ x0 + self.L[h] @ d
+            x_h = self.F[h] @ x0 + self.L[h] @ d + self.V[h]
             x_test_all = np.tile(x_h, (1, Nsamples)) +self.G[h] @ u_samples.T
             condition_pwa_dyn = np.all(region['A'] @ x_test_all <= region['b'], axis=0)
             x_test_in_region_h = x_test_all[:, condition_pwa_dyn]
@@ -233,51 +281,86 @@ class OptimalControllerPWA:
         Returns:
             Violation rate (float in [0, 1]).
         """
-        X = self.compute_sampled_pwa_dynamics_d(x0, u_seq, samples)
-        # Note: since self.Xn['b'] is a column vector, we take just the row in it (and check along the columns)
+        X, _ = self.compute_sampled_pwa_dynamics(x0, u_seq, samples)
+        # Note: since self.Xn['b'] is a vector column, we take just the row in it (and check along the columns)
         satisfaction = np.sum(np.all(X @ self.Xn['A'].transpose() <= self.Xn['b'].transpose()[0] + 1e-9, axis=1)) / len(samples)
         return 1 - satisfaction
 
-    def get_worst_case(self, x0: np.ndarray, u_seq: np.ndarray, samples: np.ndarray) -> int:
-        """
-        Get the time step where the predicted trajectories are closest to the constraint boundaries.
+
+
+    def get_sensitive_uncertainty(self, x0, u_seq, nom_scenarios, n_critical, n_influent):
+
+        '''
 
         Args:
-            x0: Initial state.
-            u_seq: Control sequence.
-            samples: Disturbance samples.
+            x0: current state at time t
+            u_seq: candidate sequence for time t+1
+            nom_scenarios: scenarios for time t+1
+            n_critical: number of critical constraints to consider
+            n_influent: number of influet uncertainty elements to consdider
 
         Returns:
-            Index of the time step with worst-case constraint margin.
-        """
+        '''
+
+        # Note: I construct feasible seq. at time t+1; hence, no shifting of uncertainty is needed at the end
+
+        # alpha_jh = 1 if scenario j triggers mode h
         # Compute all sample trajectories
-        X = self.compute_sampled_pwa_dynamics_d(x0, u_seq, samples)   # shape (Nsamples, n_x*(N_horizon+1))
+        X, alpha = self.compute_sampled_pwa_dynamics(x0, u_seq, nom_scenarios)   # shape (Nscen, n_x*(N_horizon+1))
+        n_constr_single = self.X['b'].size
         # Check distance from boundary (dist should be <= 0 for entries that satisfy constraint)
         # Note constraints holds from time 1 to N_horizon
-        dist = X @ self.Xn['A'].transpose() - self.Xn['b'].transpose()[0]   # shape (Nsamples, n_constr*(N_horizon))
-        n_constr_single = self.X['b'].size
-        # For each time step, compute max over all scenarios
-        max_over_entry = np.max(dist, axis=0)   # shape (n_x*(N_horizon),)
-        idx_max_over_entry = np.argmax(max_over_entry)
-        # The time step of the uncertainty which should be splitted (note that state at next step would be time_max_state_constr + 1)
-        time_to_split = int(idx_max_over_entry / n_constr_single)
-        return time_to_split
+
+        dist = X @ self.Xn['A'].transpose() - self.Xn['b'].transpose()[0]  # shape (Nscen, n_constr*(N_horizon))
+        # Get indices of n_critical most critical constraints, with largest first
+        flat_idx = np.argpartition(dist.ravel(), -n_critical)[-n_critical:]
+        rows, cols = np.unravel_index(flat_idx, dist.shape)
+        order = np.argsort(dist[rows, cols])[::-1]
+        rows = rows[order]
+        cols = cols[order]
+
+        idx_uncertainty = []
+
+        for l in range(n_critical):
+            j, m = rows[l], cols[l] # get indices of the maximum array element, where m = i + n_constr * k (i = idx single constr, k = time)
+            k = int(np.floor(m / n_constr_single)) + 1         # m-th constraints (in big matrix \self.X['A']) depends on at most first k values of \eta
+            # also, +1 because dist matrix does not contain constraints for x0!
+            # get mode sequence activated by scenario associated to critical constraint
+            h = np.where(alpha[j, :]==1)[0][0]
+            Gamma = self.L[h]       # matrix Gamma of the mode sequence triggered by critical scenario
+            gradients = self.Xn['A'][m] @ Gamma
+            # idx to split uncertainty
+
+            abs_grad_within_k = np.abs(gradients[0:self.n_unc*k])
+            # Get most influent entries of uncertainty from sensitivity vector (i.e., rank largest values and pick n_influent)
+            most_influent_idx = np.argpartition(abs_grad_within_k, -n_influent)[-n_influent:]
+            most_influent_idx = most_influent_idx[np.argsort(abs_grad_within_k[most_influent_idx])[::-1]]   # arr indices of n_influent values, ranked
+            # shift, since \eeta_{i|t} = \eeta_{i-n_unc | t+1}
+            idx_uncertainty.append(most_influent_idx)
+            # idx_uncertainty.append(most_influent_idx - self.n_unc)
+            # print(most_influent_idx - self.n_unc)
+        # create big array from list of array
+        idx_uncertainty = np.hstack(idx_uncertainty)
+        # remove duplicates (note: np.unique alters order! so I do differently)
+        idx_uncertainty = np.array(list(dict.fromkeys(idx_uncertainty)))
+        # remove negative numbers
+        idx_uncertainty = idx_uncertainty[idx_uncertainty >= 0]
+        # print('Ranked idx to split only positive', idx_uncertainty)
+        return idx_uncertainty
+
 
 
 class PartitionControllerPwa(OptimalControllerPWA):
     def __init__(self, n_x: int, n_u: int, n_unc: int, N_horizon: int,
-                modes: list, X: dict, U: dict,
+                 A: np.ndarray, B: np.ndarray, C: np.ndarray,
+                 E: list, e: list, modes: list, X: dict, U: dict,
                  Q: np.ndarray, R: np.ndarray,
                  x_ref: np.ndarray, u_ref: np.ndarray,
                  norm_type: int, eps: float, SOLVER: str):
         """
         Initialize PartitionControllerPwa with inherited and additional attributes for partition-based tightening.
         """
-        super().__init__(n_x, n_u, n_unc, N_horizon, modes, X, U, Q, R, x_ref, u_ref, norm_type, eps, SOLVER)
-        self.V = None
-        self.all_compact_dynamics = None
-
-        self.pwa_regions_horizon = None
+        super().__init__(n_x, n_u, n_unc, N_horizon, A, B, C, E, e, modes, X, U, Q, R, x_ref, u_ref, norm_type, eps, SOLVER)
         self.tightening = self.gamma = None
         self.min_smallest_sv = None
         self.lip_u = self.lip_unc = None
@@ -285,8 +368,9 @@ class PartitionControllerPwa(OptimalControllerPWA):
         self.u_feas = None
         self.solver = SOLVER
 
-    def optimize(self, x0: np.ndarray, delta: float, p_hat: np.ndarray, scenarios: np.ndarray,
-                 tight_or_relax: str) -> tuple:
+
+    def optimize(self, x0: np.ndarray, delta: float, p_hat: np.ndarray, scenarios: np.ndarray, tight_or_relax: str,
+                 slack:float, N_control: int) -> tuple:
         """
         Solve the partition-based optimization problem (with tightening or relaxation)
 
@@ -296,16 +380,28 @@ class PartitionControllerPwa(OptimalControllerPWA):
             p_hat: Clusters probabilities.
             scenarios: Representative scenarios.
             tight_or_relax: 'tight' or 'relax' flag.
+            slack: Slack value.
+            N_control: control horizon (<= prediction horizon)
 
         Returns:
             Tuple with optimal cost, control, binary variables, solve time, and solver status.
         """
         warnings.simplefilter("ignore")
         Nscen = len(scenarios)
-        U = cp.Variable((self.n_u * self.N_horizon, 1))
-        mu = cp.Variable((Nscen, self.num_modes_horizon),
+        U_control = cp.Variable((self.n_u * N_control, 1))
+        constr = []
+        if N_control >= self.N_horizon + 1:
+            raise ValueError('Control horizon cannot be greater than prediction horizon.')
+        elif N_control <= self.N_horizon - 1:
+            u_last = U_control[-self.n_u:] #cp.Variable((self.n_u, 1))
+            # constr += [u_last == U_control[-self.n_u:]]
+            tail_u = cp.vstack([u_last] * (self.N_horizon - N_control))
+            U = cp.vstack((U_control, tail_u))
+        else:
+            U = U_control
+        mu = cp.Variable((Nscen, self.num_modes_horizon_x0),
                          boolean=True)  # mu_{j, h} = 1 if mode h robustly satisfies scenario j
-        alpha = cp.Variable((Nscen, self.num_modes_horizon), boolean=True)  # alpha_{j, h} = 1 iff scenario j triggers mode h
+        alpha = cp.Variable((Nscen, self.num_modes_horizon_x0), boolean=True)  # alpha_{j, h} = 1 iff scenario j triggers mode h
         # Tightening
         if tight_or_relax == 'tight':
             constraint_modification = self.tightening
@@ -317,10 +413,10 @@ class PartitionControllerPwa(OptimalControllerPWA):
             constraint_modification = np.squeeze(constraint_modification, axis=-1)
         else:
             dim_modification = self.Xn['b'].shape[0] + self.pwa_regions_horizon[0]['b'].shape[0]
-            constraint_modification = np.zeros((Nscen, self.num_modes_horizon, dim_modification))
+            constraint_modification = np.zeros((Nscen, self.num_modes_horizon_x0, dim_modification))
             eps_modification = 0
         # Init cost and constraints
-        constr = [self.Un['A'] @ U <= self.Un['b']]  # Input constraints
+        constr += [self.Un['A'] @ U <= self.Un['b']]  # Input constraints
         cost = cp.norm(self.Rn @ (U - self.U_ref), self.norm_type)
         # Write scenario trajectory constraint
         constr += [cp.sum(alpha, axis=1) == 1]  # each scenario triggers exactly on mode
@@ -328,17 +424,17 @@ class PartitionControllerPwa(OptimalControllerPWA):
         M = 100  # Big-M constant
         # Y is a list, in a way that Y[h] are all the scenario trajectories given mode h
         state_dim = (self.N_horizon + 1) * self.n_x
-        Y_all = cp.Variable((Nscen * self.num_modes_horizon, state_dim))
-        Y_all_reshaped = cp.reshape(Y_all, (Nscen, self.num_modes_horizon, state_dim), order='F')
+        Y_all = cp.Variable((Nscen * self.num_modes_horizon_x0, state_dim))
+        Y_all_reshaped = cp.reshape(Y_all, (Nscen, self.num_modes_horizon_x0, state_dim), order='F')
         Xscen = cp.sum(Y_all_reshaped, axis=1)  # shape: (Nscen, state_dim)
 
         # Build the Big-M dynamics constraints for Y_all
         # Each scenario trajectory is a row vector, then stacked vertically for all modes
-        dynamics_list = [cp.transpose(self.F[h] @ x0 + self.G[h] @ U) + scenarios @ self.L[h].transpose()
-            for h in range(self.num_modes_horizon)]
+        dynamics_list = [cp.transpose(self.F[h] @ x0 + self.G[h] @ U + self.V[h]) + scenarios @ self.L[h].transpose()
+            for h in self.modes_idx_x0]
         dynamics_all = cp.vstack(dynamics_list)  # shape: (Nscen*num_modes, state_dim)
         # Similarly, for each mode we want the corresponding alpha and mu to be stacked in the same order.
-        alpha_all = cp.vstack([cp.reshape(alpha[:, h], (Nscen, 1), order='F') for h in range(self.num_modes_horizon)])
+        alpha_all = cp.vstack([cp.reshape(alpha[:, h], (Nscen, 1), order='F') for h in range(self.num_modes_horizon_x0)])
         # Now, add the big-M constraints on Y_all:
         constr += [
             Y_all <= M * alpha_all,
@@ -353,12 +449,12 @@ class PartitionControllerPwa(OptimalControllerPWA):
         # Stack left-hand and right-hand side for all modes
         nominal_lhs = cp.vstack([
             cp.matmul(Xscen, self.pwa_regions_horizon[h]['A'].T)
-            for h in range(self.num_modes_horizon)
+            for h in self.modes_idx_x0
         ])
 
         nominal_rhs = cp.vstack([
-            self.pwa_regions_horizon[h]['b'].T + 1000 * (1 - cp.reshape(alpha[:, h], (Nscen, 1), order='F'))
-            for h in range(self.num_modes_horizon)
+            self.pwa_regions_horizon[h]['b'].T + 1000 * (1 - cp.reshape(alpha[:, h_alpha], (Nscen, 1), order='F'))
+            for (h, h_alpha) in zip(self.modes_idx_x0, range(self.num_modes_horizon_x0))
         ])
 
         constr.append(nominal_lhs <= nominal_rhs)
@@ -372,15 +468,16 @@ class PartitionControllerPwa(OptimalControllerPWA):
         # Stack lhs and rhs for all modes
         robust_lhs = cp.vstack([
             cp.matmul(Xscen, np.vstack((self.Xn['A'], self.pwa_regions_horizon[h]['A'])).T)
-            for h in range(self.num_modes_horizon)
+            for h in self.modes_idx_x0
         ])
         robust_rhs = cp.vstack([
             np.vstack((self.Xn['b'], self.pwa_regions_horizon[h]['b'])).T +
             cp.reshape(constraint_modification[:, h], (Nscen, -1), order='F') +
-            1000 * (1 - cp.reshape(mu[:, h], (Nscen, 1), order='F'))
-            for h in range(self.num_modes_horizon)
+            1000 * (1 - cp.reshape(mu[:, h_mu], (Nscen, 1), order='F'))
+            for (h, h_mu) in zip(self.modes_idx_x0, range(self.num_modes_horizon_x0))
         ])
-        constr.append(robust_lhs <= robust_rhs)
+        constr.append(robust_lhs <= robust_rhs + slack)
+
         # Chance constraint
         # Sum mu[j, h]*p_hat[j] over all scenarios and modes:
         sum_satisfaction = cp.sum(cp.multiply(mu, cp.reshape(p_hat, (Nscen, 1), order='F')))
@@ -405,7 +502,7 @@ class PartitionControllerPwa(OptimalControllerPWA):
         else:
             return None, None, None, None, None, problem.status
 
-    def _compute_correction_general(self, scenarios: np.ndarray, regions: list, correction: str) -> list:
+    def _compute_correction_general(self, regions: list, correction: str) -> list:
         """
         Compute either tightening or relaxation, for general polyhedral uncertainty sets.
 
@@ -421,22 +518,22 @@ class PartitionControllerPwa(OptimalControllerPWA):
         n_theta = self.N_horizon * self.n_unc
         corrected_values = [[] for _ in range(N_scen)]
         for j in range(N_scen):
-            uncertainty_region, scenario = regions[j], scenarios[j]
-            theta_hat = scenario.reshape(-1, 1)
+            uncertainty_region = regions[j]
             # Build the constraint: kron(I, A_region) * vec(theta) <= tile(b_region)
-            for h in range(self.num_modes_horizon):
+            for h in range(self.num_modes_horizon_all):
                 D = np.vstack((self.Xn['A'] @ self.L[h], self.pwa_regions_horizon[h]['A'] @ self.L[h]))
                 dim = D.shape[0]
                 theta = cp.Variable((n_theta, dim))
                 constr = [np.kron(np.eye(dim), uncertainty_region['A']) @ cp.vec(theta, order='F').reshape((-1, 1), 'C')
                           <= np.tile(uncertainty_region['b'], (dim, 1))]
                 # Compute the difference; note that reversing the order flips the sign.
+                # Also, regions should already be translated to origin!
                 if correction == 'tightening':
-                    # For tightening: theta - tile(theta_hat)
-                    theta_matrix = theta - np.tile(theta_hat, (1, dim))
+                    # For tightening: theta
+                    theta_matrix = theta
                 else:
-                    # For gamma: tile(theta_hat) - theta
-                    theta_matrix = np.tile(theta_hat, (1, dim)) - theta
+                    # For gamma: - theta
+                    theta_matrix = - theta
 
                 cost = cp.sum(cp.multiply(D, theta_matrix.T))
                 problem = cp.Problem(cp.Maximize(cost), constr)
@@ -449,7 +546,8 @@ class PartitionControllerPwa(OptimalControllerPWA):
                 corrected_values[j].append(-value if correction == 'tightening' else value)
         return corrected_values
 
-    def _compute_correction_box(self, scenarios: np.ndarray, boxes: list, correction: str) -> list:
+
+    def _compute_correction_box(self, boxes: list, correction: str) -> list:
         """
         Compute constraint tightening/relaxation for box-shaped uncertainty sets.
 
@@ -461,19 +559,18 @@ class PartitionControllerPwa(OptimalControllerPWA):
         Returns:
             List of lists of correction vectors (one per mode and cluster).
         """
-        N_scen = len(scenarios)
+        N_scen = len(boxes)
         corrected_values = [[] for _ in range(N_scen)]
         for j in range(N_scen):
             box_j = boxes[j].T
             lb_j, ub_j = box_j[0], box_j[1]
-            scenario = scenarios[j]
             if correction == 'tightening':
-                lb_j_trans = lb_j - scenario
-                ub_j_trans = ub_j - scenario
+                lb_j_trans = lb_j
+                ub_j_trans = ub_j
             else:
-                lb_j_trans = scenario - ub_j
-                ub_j_trans = scenario - lb_j
-            for h in range(self.num_modes_horizon):
+                lb_j_trans = - ub_j
+                ub_j_trans = - lb_j
+            for h in range(self.num_modes_horizon_all):
                 D = np.vstack((self.Xn['A'] @ self.L[h], self.pwa_regions_horizon[h]['A'] @ self.L[h]))
                 # Select ub where condition is True and lb otherwise.
                 selected_values = np.where(D >= 0, ub_j_trans, lb_j_trans)
@@ -484,7 +581,7 @@ class PartitionControllerPwa(OptimalControllerPWA):
                 corrected_values[j].append(-value if correction == 'tightening' else value)
         return corrected_values
 
-    def set_tightening(self, scenarios: np.ndarray, regions: list = None, boxes: list = None) -> None:
+    def set_tightening(self, regions: list = None, boxes: list = None, tightening: list = None) -> list:
         """
         Set constraint tightening from box or polyhedral regions.
 
@@ -492,13 +589,17 @@ class PartitionControllerPwa(OptimalControllerPWA):
             scenarios: Representative scenarios.
             regions: Polyhedral sets.
             boxes: Box sets.
+            tightening: values if already available
         """
-        if boxes is not None:
-            self.tightening = self._compute_correction_box(scenarios, boxes, 'tightening')
+        if tightening is not None:
+            self.tightening = tightening
+        elif boxes is not None:
+            self.tightening = self._compute_correction_box(boxes, 'tightening')
         elif regions is not None:
-            self.tightening = self._compute_correction_general(scenarios, regions, 'tightening')
+            self.tightening = self._compute_correction_general(regions, 'tightening')
         else:
             raise ValueError('Either specify polytopes or boxes for uncertainty sets.')
+        return self.tightening
 
     def set_gamma(self, scenarios: np.ndarray, regions: list = None, boxes: list = None) -> None:
         """
@@ -516,13 +617,14 @@ class PartitionControllerPwa(OptimalControllerPWA):
         else:
             raise ValueError('Either specify polytopes or boxes for uncertainty sets.')
 
+
     def set_minimum_smallest_sv(self) -> None:
         """
         Compute the minimum smallest singular value across all invertible square submatrices,
         of matrix 'A' of the polytope defining the intersection between constraint and pwa region.
         """
         min_smallest_sv = []
-        for h in range(self.num_modes_horizon):
+        for h in self.modes_idx_x0:
             # Wrt linear case, have to compute intersection with region
             Xn_and_region = np.vstack((self.Xn['A'], self.pwa_regions_horizon[h]['A']))
             A = Xn_and_region @ self.G[h]
@@ -548,14 +650,14 @@ class PartitionControllerPwa(OptimalControllerPWA):
         Estimate Lipschitz constant of cost function w.r.t. control input for 1-norm cost.
 
         Returns:
-        Lipschitz constant (float).
+            Lipschitz constant (float).
         """
         if self.norm_type == 1:
             Qn = self.Qn
             Rn = self.Rn
             L1 = np.linalg.norm(Qn, 1)
             L2_list = []
-            for h in range(self.num_modes_horizon):
+            for h in self.modes_idx_x0:
                 L2_list.append(np.linalg.norm(self.G[h], 1))
             self.lip_u = (L1 * max(L2_list) + np.linalg.norm(Rn, 1)) * np.sqrt(self.n_u * self.N_horizon)
             return self.lip_u
@@ -572,7 +674,7 @@ class PartitionControllerPwa(OptimalControllerPWA):
             Qn = self.Qn
             L1 = np.linalg.norm(Qn, 1)
             L2_list = []
-            for h in range(self.num_modes_horizon):
+            for h in self.modes_idx_x0:
                 L2_list.append(np.linalg.norm(self.L[h], 1))
             self.lip_unc = L1 * max(L2_list)
             return self.lip_unc
@@ -612,8 +714,6 @@ class PartitionControllerPwa(OptimalControllerPWA):
             empirical_lip_constant = max(lip)
             self.lip_unc = empirical_lip_constant
             return self.lip_unc
-        else:
-            raise ValueError('So far, only 1-norm for PWA performance bounds!')
 
     def set_lip_constant_u_sampling(self, x0: np.ndarray, uncertainty_box: np.ndarray) -> float:
         """
@@ -621,7 +721,7 @@ class PartitionControllerPwa(OptimalControllerPWA):
 
         Args:
             x0: Initial state.
-            uncertainty_box: Box describing uncertainty support.
+            uncertainty_box: Box describing uncertainty domain.
 
         Returns:
             Empirical Lipschitz constant (float).
@@ -629,8 +729,7 @@ class PartitionControllerPwa(OptimalControllerPWA):
         if self.norm_type == 1:
             Qn = self.Qn
             Rn = self.Rn
-            u_box = np.array([-np.ones(self.N_horizon * self.n_u), np.ones(self.N_horizon * self.n_u)]) * np.abs(
-                self.U['b'][0, 0])
+            u_box = np.array([-np.ones(self.N_horizon * self.n_u), np.ones(self.N_horizon * self.n_u)]) * np.abs(self.U['b'][0, 0])
             dim = u_box.shape[1]
             samples1 = np.random.uniform(low=u_box[0], high=u_box[1], size=(500, dim))
             samples2 = np.random.uniform(low=u_box[0], high=u_box[1], size=(500, dim))
@@ -654,7 +753,7 @@ class PartitionControllerPwa(OptimalControllerPWA):
         else:
             raise ValueError('So far, only 1-norm for PWA performance bounds!')
 
-    def compute_c(self, nominal_scen: list, clusters: list, N_samples: int) -> float:
+    def compute_c(self, nominal_scen: np.ndarray, clusters: list, N_samples: int) -> float:
         """
         Compute error term due to partitioning.
 
@@ -674,7 +773,8 @@ class PartitionControllerPwa(OptimalControllerPWA):
         c = c * self.lip_unc
         return c
 
-    def get_performances(self, x0, lam, clusters, nominal_scen, p_hat, delta, Nsamples, validation_set, lb, r):
+    def get_performances(self, x0: np.ndarray, lam: float, clusters: list, nominal_scen: np.ndarray, p_hat: np.ndarray,
+                         delta: float, Nsamples: int, validation_set: np.ndarray, lb: str, r:float):
         """
         Get controller performance: upper and lower bound, and empirical probability of constraint violation,
         associated to approximate control problem.
@@ -701,18 +801,18 @@ class PartitionControllerPwa(OptimalControllerPWA):
             empirical_violation = self.get_empirical_violation(x0, u_feas, validation_set)
             c = self.compute_c(nominal_scen, clusters, Nsamples)
             ub = cost_pp + c + lam + 2 * self.lip_u * r
-            if lb == 'th':
+            if lb=='th':
                 bound_lhs = self.lip_u * (np.max(self.gamma) - np.max(self.tightening)) * np.sqrt(
-                    self.n_u * self.N_horizon) / self.min_smallest_sv + c + lam
+                    self.n_u * self.N_horizon) / self.min_smallest_sv + c + lam + 2 * self.lip_u * r
                 lb_th = cost_pp - bound_lhs
                 return empirical_violation, lb_th, ub
-            elif lb == 'aux':
+            elif lb=='aux':
                 cost_lb, _, _, _, time_lb_aux, _ = self.optimize(x0, delta, p_hat, nominal_scen, 'relax')
-                lb_aux = cost_lb - c - lam
+                lb_aux = cost_lb - c - lam - 2 * self.lip_u * r
                 return empirical_violation, lb_aux, ub
-            elif lb == 'both':
+            elif lb=='both':
                 bound_lhs = self.lip_u * (np.max(np.array(self.gamma) - np.array(self.tightening))) * np.sqrt(
-                    self.n_u * self.N_horizon) / self.min_smallest_sv + c + lam
+                    self.n_u * self.N_horizon) / self.min_smallest_sv + c + lam + 2 * self.lip_u * r
                 lb_th = cost_pp - bound_lhs
                 cost_lb_aux, _, _, _, time_lb_aux, _ = self.optimize(x0, delta, p_hat, nominal_scen, 'relax')
                 lb_aux = cost_lb_aux - c - lam - 2 * self.lip_u * r
@@ -723,16 +823,16 @@ class PartitionControllerPwa(OptimalControllerPWA):
 
 class RandomizedController(OptimalControllerPWA):
     def __init__(self, n_x: int, n_u: int, n_unc: int, N_horizon: int,
-                 modes: list, X: dict, U: dict, Q: np.ndarray, R: np.ndarray,
+                 A, B, C, E, e, modes: list, X: dict, U: dict, Q: np.ndarray, R: np.ndarray,
                  x_ref: np.ndarray, u_ref: np.ndarray, norm_type: int, eps: float,
                  SOLVER: str):
         """
         Initialize RandomizedController with inherited structure.
         """
-        super().__init__(n_x, n_u, n_unc, N_horizon, modes, X, U, Q, R, x_ref, u_ref, norm_type, eps,
+        super().__init__(n_x, n_u, n_unc, N_horizon, A, B, C, E, e, modes, X, U, Q, R, x_ref, u_ref, norm_type, eps,
                          SOLVER)
 
-    def optimize(self, x0: np.ndarray, scenarios: np.ndarray) -> tuple:
+    def optimize(self, x0: np.ndarray, scenarios: np.ndarray, max_time) -> tuple:
         """
         Solve a randomized optimization problem given N samples.
 
@@ -744,10 +844,9 @@ class RandomizedController(OptimalControllerPWA):
             Tuple of (optimal cost, optimal input, mode-scenario assignment, solve time, status),
             or None values if problem is infeasible.
         """
-        num_modes_horizon = int(self.num_modes_horizon)
         Nscen = len(scenarios)
         U = cp.Variable((self.n_u * self.N_horizon, 1))
-        alpha = cp.Variable((Nscen, num_modes_horizon), boolean=True)  # alpha_{j, h} = 1 iff scenario j triggers mode h
+        alpha = cp.Variable((Nscen, self.num_modes_horizon_x0), boolean=True)  # alpha_{j, h} = 1 iff scenario j triggers mode h
         # Init cost and constraints
         constr = [self.Un['A'] @ U <= self.Un['b']]  # Input constraints
         cost = cp.norm(self.Rn @ (U - self.U_ref), self.norm_type)
@@ -757,18 +856,17 @@ class RandomizedController(OptimalControllerPWA):
         M = 1000  # Big-M constant
         # Y is a list, in a way that Y[h] are all the scenario trajectories given mode h
         state_dim = (self.N_horizon + 1) * self.n_x
-        num_modes = num_modes_horizon
-        Y_all = cp.Variable((Nscen * num_modes, state_dim))
-        Y_all_reshaped = cp.reshape(Y_all, (Nscen, num_modes, state_dim), order='F')
+        Y_all = cp.Variable((Nscen * self.num_modes_horizon_x0, state_dim))
+        Y_all_reshaped = cp.reshape(Y_all, (Nscen, self.num_modes_horizon_x0, state_dim), order='F')
         Xscen = cp.sum(Y_all_reshaped, axis=1)  # shape: (Nscen, state_dim)
 
         # Build the Big-M dynamics constraints for Y_all
         # Each scenario trajectory is a row vector, then stacked vertically for all modes
-        dynamics_list = [cp.transpose(self.F[h] @ x0 + self.G[h] @ U) + scenarios @ self.L[h].transpose()
-            for h in range(num_modes)]
+        dynamics_list = [cp.transpose(self.F[h] @ x0 + self.G[h] @ U + self.V[h]) + scenarios @ self.L[h].transpose()
+            for h in self.modes_idx_x0]
         dynamics_all = cp.vstack(dynamics_list)  # shape: (Nscen*num_modes, state_dim)
         # Similarly, for each mode we want the corresponding alpha and mu to be stacked in the same order.
-        alpha_all = cp.vstack([cp.reshape(alpha[:, h], (Nscen, 1), order='F') for h in range(num_modes)])
+        alpha_all = cp.vstack([cp.reshape(alpha[:, h], (Nscen, 1), order='F') for h in range(self.num_modes_horizon_x0)])
         # Now, add the big-M constraints on Y_all:
         constr += [
             Y_all <= M * alpha_all,
@@ -783,12 +881,12 @@ class RandomizedController(OptimalControllerPWA):
         # Stack left-hand and right-hand side for all modes
         nominal_lhs = cp.vstack([
             cp.matmul(Xscen, self.pwa_regions_horizon[h]['A'].T)
-            for h in range(num_modes)
+            for h in self.modes_idx_x0
         ])
 
         nominal_rhs = cp.vstack([
-            self.pwa_regions_horizon[h]['b'].T + 1000 * (1 - cp.reshape(alpha[:, h], (Nscen, 1), order='F'))
-            for h in range(num_modes)
+            self.pwa_regions_horizon[h]['b'].T + 1000 * (1 - cp.reshape(alpha[:, h_alpha], (Nscen, 1), order='F'))
+            for (h, h_alpha) in zip(self.modes_idx_x0, range(self.num_modes_horizon_x0))
         ])
         constr.append(nominal_lhs <= nominal_rhs)
 
@@ -808,7 +906,7 @@ class RandomizedController(OptimalControllerPWA):
         cost += cp.sum(scen_cost) * 1 / Nscen
 
         problem = cp.Problem(cp.Minimize(cost), constr)
-        problem.solve(verbose=False, solver='GUROBI')
+        problem.solve(verbose=False, solver='GUROBI', TimeLimit=max_time)
         self.u_feas = U.value
         self.u_optimal = U.value
         self.cost_optimal = cost.value
@@ -836,9 +934,9 @@ class RandomizedController(OptimalControllerPWA):
         """
         def binomial_sum(N):
             """Computes the summation for a given N."""
-            return sum(comb(N, i) * (epsilon ** i) * ((1 - epsilon) ** (N - i)) for i in range(d)) * self.num_modes_horizon
+            return sum(comb(N, i) * (epsilon ** i) * ((1 - epsilon) ** (N - i)) for i in range(d)) * self.num_modes_horizon_x0
         # Initial bounds for bisection
-        high = 2 / epsilon * (d - 1 + np.log(1 / beta))
+        high = 2 / epsilon * (d - 1 + np.log(self.num_modes_horizon_x0 / beta))
         N_ini = round(high / 4)
         # Bisection method
         for _ in range(max_iter):
